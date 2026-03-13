@@ -65,7 +65,7 @@
 .gw-input-row {
     display: flex;
     gap: 8px;
-    align-items: flex-end;
+    align-items: stretch;
 }
 
 .gw-input {
@@ -78,8 +78,7 @@
     font-size: 14px !important;
     line-height: 1.4;
     resize: none;
-    min-height: 20px;
-    max-height: 150px;
+    height: 60px;
     overflow-y: auto;
     transition: border-color 0.2s ease;
     font-family: inherit;

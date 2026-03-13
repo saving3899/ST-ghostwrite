@@ -481,17 +481,13 @@ function createGhostwriteUI() {
             }
         });
 
-        // Auto-resize and persist draft
+        // Persist draft
         const textarea = panel.querySelector('#gw-input');
         if (textarea) {
-            // Initial height calculation
-            setTimeout(() => updateInputHeight(), 100);
-
             textarea.addEventListener('input', () => {
                 const s = getSettings();
                 s.draftInput = textarea.value;
                 saveSettingsDebounced();
-                updateInputHeight();
             });
         }
     }
@@ -517,13 +513,7 @@ function createGhostwriteUI() {
  * 텍스트 내용에 맞춰 인풋창 높이 조절
  */
 function updateInputHeight() {
-    const textarea = document.querySelector('#gw-input');
-    if (!textarea) return;
-
-    textarea.style.height = 'auto';
-    // Use a temporary scroll height check
-    const newHeight = Math.max(textarea.scrollHeight, 40);
-    textarea.style.height = Math.min(newHeight, 150) + 'px';
+    // No-op - height managed by CSS
 }
 
 function togglePanel() {
@@ -546,10 +536,9 @@ function togglePanel() {
     }
     if (leftBtn) leftBtn.classList.toggle('gw-tab-active', panelVisible);
 
-    // Focus and update height when opening
+    // Focus when opening
     if (panelVisible) {
         setTimeout(() => {
-            updateInputHeight();
             document.querySelector('#gw-input')?.focus();
         }, 100);
     }
