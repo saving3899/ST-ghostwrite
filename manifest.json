@@ -1,0 +1,11 @@
+{
+    "display_name": "✍️ 대필",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "saving3899",
+    "version": "1.0.0",
+    "description": "대필 입력 및 실행 확장 프로그램"
+}
