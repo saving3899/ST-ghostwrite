@@ -217,6 +217,222 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
+function normalizeId(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/^third-party\//, '')
+        .replace(/^st[-_]/, '')
+        .replace(/[\s._-]+/g, '');
+}
+
+function getExcludedPromptKeys(settings, ctx) {
+    const selected = settings.excludedExtensions || [];
+    const prompts = ctx?.extensionPrompts || {};
+    const keys = Object.keys(prompts);
+    const normalizedKeyMap = new Map(keys.map(k => [normalizeId(k), k]));
+    const result = new Set();
+
+    for (const raw of selected) {
+        const name = String(raw || '');
+        if (!name) continue;
+
+        if (keys.includes(name)) {
+            result.add(name);
+            continue;
+        }
+
+        const normalized = normalizeId(name);
+        const direct = normalizedKeyMap.get(normalized);
+        if (direct) {
+            result.add(direct);
+            continue;
+        }
+
+        for (const key of keys) {
+            const nk = normalizeId(key);
+            if (!nk) continue;
+            if (nk.includes(normalized) || normalized.includes(nk)) {
+                result.add(key);
+            }
+        }
+    }
+
+    return Array.from(result);
+}
+
+function getExclusionCandidateNames() {
+    const settingsDriven = Object.keys(extension_settings)
+        .filter(name => {
+            if (name === MODULE_NAME) return false;
+            const conf = extension_settings[name];
+            if (!conf || typeof conf !== 'object') return false;
+            if (conf.promptInjection) return true;
+            if (conf.injection) return true;
+            if (conf.insertType !== undefined) return true;
+            if (typeof conf.prompt === 'string' && conf.prompt.length > 0) return true;
+            if (typeof conf.systemPrompt === 'string') return true;
+            if (typeof conf.injectionPrompt === 'string') return true;
+            return false;
+        });
+
+    const ctx = getContext();
+    const runtimeDriven = Object.keys(ctx.extensionPrompts || {})
+        .filter(name => name && name !== MODULE_NAME);
+
+    return Array.from(new Set([...settingsDriven, ...runtimeDriven])).sort();
+}
+
+function normalizeExcludedWIEntries(entries) {
+    const result = [];
+    const seen = new Set();
+
+    for (const item of Array.isArray(entries) ? entries : []) {
+        const world = String(item?.world || '').trim();
+        const uid = Number(item?.uid);
+        if (!world || !Number.isFinite(uid)) continue;
+        const key = normalizeWIEntryKey(world, uid);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push({ world, uid });
+    }
+
+    return result;
+}
+
+function runOptimization() {
+    const s = getSettings();
+    const candidates = getExclusionCandidateNames();
+    const normalizedCandidateMap = new Map(candidates.map(name => [normalizeId(name), name]));
+
+    let extRemoved = 0;
+    let extRemapped = 0;
+    let wiBookRemoved = 0;
+
+    const optimizedExcludedExt = [];
+    const seenExt = new Set();
+
+    for (const raw of Array.isArray(s.excludedExtensions) ? s.excludedExtensions : []) {
+        const src = String(raw || '').trim();
+        if (!src) continue;
+
+        let canonical = null;
+
+        if (candidates.includes(src)) {
+            canonical = src;
+        } else {
+            const normalized = normalizeId(src);
+            canonical = normalizedCandidateMap.get(normalized) || null;
+            if (!canonical) {
+                canonical = candidates.find(name => {
+                    const nk = normalizeId(name);
+                    return nk.includes(normalized) || normalized.includes(nk);
+                }) || null;
+            }
+            if (canonical) extRemapped++;
+        }
+
+        if (!canonical) {
+            extRemoved++;
+            continue;
+        }
+
+        if (!seenExt.has(canonical)) {
+            seenExt.add(canonical);
+            optimizedExcludedExt.push(canonical);
+        }
+    }
+
+    const optimizedWIBooks = [];
+    const seenBooks = new Set();
+    for (const raw of Array.isArray(s.excludedWIBooks) ? s.excludedWIBooks : []) {
+        const name = String(raw || '').trim();
+        if (!name) {
+            wiBookRemoved++;
+            continue;
+        }
+        if (seenBooks.has(name)) continue;
+        seenBooks.add(name);
+        optimizedWIBooks.push(name);
+    }
+
+    const optimizedWIEntries = normalizeExcludedWIEntries(s.excludedWIEntries);
+    const wiEntryRemoved = (Array.isArray(s.excludedWIEntries) ? s.excludedWIEntries.length : 0) - optimizedWIEntries.length;
+
+    s.excludedExtensions = optimizedExcludedExt;
+    s.excludedWIBooks = optimizedWIBooks;
+    s.excludedWIEntries = optimizedWIEntries;
+
+    saveSettings();
+    populateExcludedExtensionsList();
+
+    const message = `최적화 완료: 확장 remap ${extRemapped}개, 확장 삭제 ${extRemoved}개, WI 책 정리 ${wiBookRemoved}개, WI 항목 정리 ${Math.max(wiEntryRemoved, 0)}개`;
+    toastr.success(message);
+    console.info('[ST-ghostwrite] Optimization summary', {
+        extRemapped,
+        extRemoved,
+        wiBookRemoved,
+        wiEntryRemoved: Math.max(wiEntryRemoved, 0),
+        totalExtCandidates: candidates.length,
+    });
+}
+
+function runDiagnostics() {
+    const s = getSettings();
+    const ctx = getContext();
+    const candidates = getExclusionCandidateNames();
+    const matchedPromptKeys = getExcludedPromptKeys(s, ctx);
+
+    const selectedExt = Array.isArray(s.excludedExtensions) ? s.excludedExtensions.length : 0;
+    const selectedBooks = Array.isArray(s.excludedWIBooks) ? s.excludedWIBooks.length : 0;
+    const selectedEntries = Array.isArray(s.excludedWIEntries) ? s.excludedWIEntries.length : 0;
+
+    toastr.info(`진단: 제외 확장 ${selectedExt}개, 매칭 프롬프트 ${matchedPromptKeys.length}개, 제외 WI 책 ${selectedBooks}개, 제외 WI 항목 ${selectedEntries}개`);
+
+    console.info('[ST-ghostwrite] Diagnostics', {
+        excludedExtensions: s.excludedExtensions || [],
+        exclusionCandidates: candidates,
+        matchedPromptKeys,
+        excludedWIBooks: s.excludedWIBooks || [],
+        excludedWIEntries: s.excludedWIEntries || [],
+        selectedWorldInfoBooks: selected_world_info,
+        runtimePromptKeyCount: Object.keys(ctx.extensionPrompts || {}).length,
+    });
+}
+
+function normalizeWIEntryKey(world, uid) {
+    return `${String(world || '')}::${String(uid)}`;
+}
+
+function shouldExcludeWIEntry(entry, excludedBooks, excludedEntryKeys) {
+    if (!entry || typeof entry !== 'object') return false;
+    if (excludedBooks.has(String(entry.world || ''))) return true;
+    return excludedEntryKeys.has(normalizeWIEntryKey(entry.world, entry.uid));
+}
+
+function filterWIEntriesInPlace(entries, excludedBooks, excludedEntryKeys) {
+    if (!Array.isArray(entries) || entries.length === 0) return;
+    for (let i = entries.length - 1; i >= 0; i--) {
+        if (shouldExcludeWIEntry(entries[i], excludedBooks, excludedEntryKeys)) {
+            entries.splice(i, 1);
+        }
+    }
+}
+
+function createWILoadFilterHandler(settings) {
+    const excludedBooks = new Set((settings.excludedWIBooks || []).map(String));
+    const excludedEntryKeys = new Set(
+        (settings.excludedWIEntries || []).map(e => normalizeWIEntryKey(e?.world, e?.uid)),
+    );
+
+    return function onWILoaded(payload) {
+        if (!payload || (!excludedBooks.size && !excludedEntryKeys.size)) return;
+        filterWIEntriesInPlace(payload.globalLore, excludedBooks, excludedEntryKeys);
+        filterWIEntriesInPlace(payload.characterLore, excludedBooks, excludedEntryKeys);
+        filterWIEntriesInPlace(payload.chatLore, excludedBooks, excludedEntryKeys);
+        filterWIEntriesInPlace(payload.personaLore, excludedBooks, excludedEntryKeys);
+    };
+}
+
 // ══════════════════════════════════════════════════════
 //  MODEL SWAP HELPER
 // ══════════════════════════════════════════════════════
@@ -311,9 +527,30 @@ async function doGhostwrite() {
 
     let restoreModel = null;
     const savedExtSettings = {};
+    const savedExtensionPrompts = {};
+    let wiLoadFilterHandler = null;
 
     try {
+        const ctx = getContext();
+
+        // Filter excluded WI entries directly on WI load event for this run.
+        // This ensures exclusions apply even if cached world objects are cloned.
+        wiLoadFilterHandler = createWILoadFilterHandler(settings);
+        eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, wiLoadFilterHandler);
+
+        // Directly mute selected extension prompts during ghostwrite.
+        // This is more reliable than toggling extension settings because
+        // generation reads from ctx.extensionPrompts.
+        for (const key of getExcludedPromptKeys(settings, ctx)) {
+            const prompt = ctx.extensionPrompts?.[key];
+            if (!prompt) continue;
+            savedExtensionPrompts[key] = { ...prompt };
+            prompt.value = '';
+        }
+
         // Temporarily disable excluded extensions by overriding their settings
+        // (legacy fallback for extensions that regenerate prompts from settings
+        // right before generation)
         const excluded = settings.excludedExtensions || [];
         for (const extName of excluded) {
             const extConf = extension_settings[extName];
@@ -354,6 +591,21 @@ async function doGhostwrite() {
         console.error('[ST-ghostwrite] Generation error:', err);
         toastr.error('대필 실패: ' + (err.message || err));
     } finally {
+        // Remove temporary WI filter hook
+        if (wiLoadFilterHandler) {
+            eventSource.removeListener(event_types.WORLDINFO_ENTRIES_LOADED, wiLoadFilterHandler);
+        }
+
+        // Restore muted extension prompts
+        const ctx = getContext();
+        for (const [key, originalPrompt] of Object.entries(savedExtensionPrompts)) {
+            if (ctx.extensionPrompts?.[key]) {
+                Object.assign(ctx.extensionPrompts[key], originalPrompt);
+            } else if (ctx.extensionPrompts) {
+                ctx.extensionPrompts[key] = originalPrompt;
+            }
+        }
+
         // Restore excluded extensions to their original settings
         for (const [extName, originalConf] of Object.entries(savedExtSettings)) {
             Object.assign(extension_settings[extName], originalConf);
@@ -718,6 +970,17 @@ function createSettingsUI() {
                         <div style="font-size: 11px!important; opacity: 0.7; margin-bottom: 4px;">
                             체크된 확장의 프롬프트가 대필 생성 시 제외됩니다.
                         </div>
+                        <div style="display:flex; gap:4px; margin-bottom:6px; flex-wrap:wrap;">
+                            <button id="gw_optimize_btn" class="menu_button" style="flex:1; font-size:11px!important; gap:4px; min-width:0; padding: 6px 0;" title="구버전 설정 정리 및 매핑">
+                                <i class="fa-solid fa-wand-magic-sparkles"></i> 최적화
+                            </button>
+                            <button id="gw_diagnose_btn" class="menu_button" style="flex:1; font-size:11px!important; gap:4px; min-width:0; padding: 6px 0;" title="현재 제외 매칭 상태 진단">
+                                <i class="fa-solid fa-stethoscope"></i> 진단
+                            </button>
+                            <button id="gw_refresh_ext_list_btn" class="menu_button" style="flex:1; font-size:11px!important; gap:4px; min-width:0; padding: 6px 0;" title="제외 목록 다시 불러오기">
+                                <i class="fa-solid fa-rotate"></i> 새로고침
+                            </button>
+                        </div>
                         <div id="gw_excluded_extensions" style="max-height:150px; overflow-y:auto; border:1px solid var(--SmartThemeBorderColor); border-radius:6px; padding:6px;"></div>
                     </div>
                     <hr>
@@ -784,27 +1047,10 @@ function populateExcludedExtensionsList() {
 
     const settings = getSettings();
     const excluded = settings.excludedExtensions || [];
-
-    // Only show extensions that likely inject prompts into the generation pipeline.
-    // Filter by checking for prompt-related fields in their settings.
-    const extNames = Object.keys(extension_settings)
-        .filter(name => {
-            if (name === MODULE_NAME) return false;
-            const conf = extension_settings[name];
-            if (!conf || typeof conf !== 'object') return false;
-            // Check for common prompt injection indicators
-            if (conf.promptInjection) return true;
-            if (conf.injection) return true;
-            if (conf.insertType && conf.insertType !== undefined) return true;
-            if (typeof conf.prompt === 'string' && conf.prompt.length > 0) return true;
-            if (typeof conf.systemPrompt === 'string') return true;
-            if (typeof conf.injectionPrompt === 'string') return true;
-            return false;
-        })
-        .sort();
+    const extNames = getExclusionCandidateNames();
 
     if (extNames.length === 0) {
-        container.innerHTML = '<div style="font-size:12px!important; opacity:0.6; padding:4px;">프롬프트를 주입하는 확장이 감지되지 않았습니다.</div>';
+        container.innerHTML = '<div style="font-size:12px!important; opacity:0.6; padding:4px;">감지된 확장 프롬프트가 없습니다.</div>';
         return;
     }
 
@@ -1064,6 +1310,12 @@ function bindSettingsEvents() {
     });
 
     document.querySelector('#gw_load_wi')?.addEventListener('click', () => populateWIExclusionList());
+    document.querySelector('#gw_optimize_btn')?.addEventListener('click', runOptimization);
+    document.querySelector('#gw_diagnose_btn')?.addEventListener('click', runDiagnostics);
+    document.querySelector('#gw_refresh_ext_list_btn')?.addEventListener('click', () => {
+        populateExcludedExtensionsList();
+        toastr.info('확장 프롬프트 목록을 다시 불러왔습니다.');
+    });
 
     // ── Template Preset System ──
     function updateTplSelect(forceSelect) {
