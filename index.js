@@ -180,6 +180,8 @@ const defaultSettings = {
     // World Info exclusion: entire books or specific entries
     excludedWIBooks: [],       // ['bookName1', 'bookName2']
     excludedWIEntries: [],     // [{ world: 'bookName', uid: 0 }, ...]
+    // Persist active draft input
+    draftInput: '',
 };
 
 // ── State ─────────────────────────────────────────────
@@ -435,7 +437,7 @@ function createGhostwriteUI() {
         panel.innerHTML = `
             <div class="gw-panel-inner">
                 <div class="gw-input-row">
-                    <textarea id="gw-input" class="gw-input" placeholder="대필할 내용을 입력하세요" rows="2" spellcheck="false"></textarea>
+                    <textarea id="gw-input" class="gw-input" placeholder="대필할 내용을 입력하세요" rows="2" spellcheck="false">${escapeHtml(settings.draftInput || '')}</textarea>
                     <div class="gw-input-actions">
                         <div class="gw-util-btns">
                             <button id="gw-history-btn" class="gw-icon-btn" title="히스토리">
@@ -465,6 +467,9 @@ function createGhostwriteUI() {
             if (textarea) {
                 textarea.value = '';
                 textarea.style.height = 'auto';
+                const s = getSettings();
+                s.draftInput = '';
+                saveSettingsDebounced();
                 textarea.focus();
             }
         });
@@ -476,12 +481,17 @@ function createGhostwriteUI() {
             }
         });
 
-        // Auto-resize textarea
+        // Auto-resize and persist draft
         const textarea = panel.querySelector('#gw-input');
         if (textarea) {
+            // Initial height calculation
+            setTimeout(() => updateInputHeight(), 100);
+
             textarea.addEventListener('input', () => {
-                textarea.style.height = 'auto';
-                textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
+                const s = getSettings();
+                s.draftInput = textarea.value;
+                saveSettingsDebounced();
+                updateInputHeight();
             });
         }
     }
@@ -503,6 +513,19 @@ function createGhostwriteUI() {
     }
 }
 
+/**
+ * 텍스트 내용에 맞춰 인풋창 높이 조절
+ */
+function updateInputHeight() {
+    const textarea = document.querySelector('#gw-input');
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    // Use a temporary scroll height check
+    const newHeight = Math.max(textarea.scrollHeight, 40);
+    textarea.style.height = Math.min(newHeight, 150) + 'px';
+}
+
 function togglePanel() {
     panelVisible = !panelVisible;
     const panel = document.querySelector('#gw-panel');
@@ -515,7 +538,6 @@ function togglePanel() {
         } else {
             panel.classList.remove('gw-panel-visible');
             panel.classList.add('gw-panel-closing');
-            // After animation ends, hide completely
             panel.addEventListener('animationend', function onEnd() {
                 panel.removeEventListener('animationend', onEnd);
                 panel.classList.remove('gw-panel-closing');
@@ -524,11 +546,12 @@ function togglePanel() {
     }
     if (leftBtn) leftBtn.classList.toggle('gw-tab-active', panelVisible);
 
-    // Focus input when opening
+    // Focus and update height when opening
     if (panelVisible) {
         setTimeout(() => {
+            updateInputHeight();
             document.querySelector('#gw-input')?.focus();
-        }, 200);
+        }, 100);
     }
 }
 
