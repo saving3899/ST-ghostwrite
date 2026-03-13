@@ -172,6 +172,8 @@ const defaultSettings = {
     instructionTemplate: DEFAULT_INSTRUCTION_TEMPLATE,
     // Template presets { name: templateString }
     templatePresets: { 'Default': DEFAULT_INSTRUCTION_TEMPLATE },
+    // Persist custom model name
+    customModelName: '',
     // History
     inputHistory: [],
     maxHistory: 30,
@@ -699,7 +701,7 @@ function createSettingsUI() {
                                 <select id="gw_model_select" class="text_pole">
                                     ${modelOptions}
                                 </select>
-                                <input type="text" id="gw_model_custom" class="text_pole" value="${escapeHtml(isCustomModel ? sysModel : '')}" placeholder="모델명 직접 입력" style="margin-top:6px; ${isCustomModel ? '' : 'display:none;'}" />
+                                <input type="text" id="gw_model_custom" class="text_pole" value="${escapeHtml(settings.customModelName || '')}" placeholder="모델명 직접 입력" style="margin-top:6px; ${isCustomModel ? '' : 'display:none;'}" />
                             </div>
                         </div>
                     </div>
@@ -1028,8 +1030,8 @@ function bindSettingsEvents() {
                 customInput.style.display = '';
                 customInput.focus();
                 // Apply current custom input value immediately
-                if (customInput.value.trim()) {
-                    s.model = customInput.value.trim();
+                if (s.customModelName) {
+                    s.model = s.customModelName;
                     saveSettings();
                 }
             }
@@ -1043,6 +1045,7 @@ function bindSettingsEvents() {
 
     const customModelHandler = function () {
         const s = getSettings();
+        s.customModelName = this.value;
         s.model = this.value;
         saveSettings();
     };
@@ -1188,7 +1191,7 @@ function updateModelDropdown() {
     const customInput = document.querySelector('#gw_model_custom');
     if (customInput) {
         customInput.style.display = isCustom ? '' : 'none';
-        if (isCustom) customInput.value = currentModel;
+        customInput.value = settings.customModelName || '';
     }
 }
 
