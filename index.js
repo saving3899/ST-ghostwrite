@@ -11,7 +11,7 @@ import {
 
 import { extension_settings, getContext } from '../../../extensions.js';
 import { SECRET_KEYS, secret_state } from '../../../secrets.js';
-import { getSortedEntries, loadWorldInfo, selected_world_info } from '../../../world-info.js';
+import { getSortedEntries, selected_world_info } from '../../../world-info.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
 const MODULE_NAME = 'ST-ghostwrite';
@@ -361,6 +361,7 @@ function runOptimization() {
     s.excludedExtensions = optimizedExcludedExt;
     s.excludedWIBooks = optimizedWIBooks;
     s.excludedWIEntries = optimizedWIEntries;
+    s.recoveryVersion = 2;
 
     saveSettings();
     populateExcludedExtensionsList();
@@ -374,6 +375,7 @@ function runOptimization() {
         wiEntryRemoved: Math.max(wiEntryRemoved, 0),
         totalExtCandidates: candidates.length,
     });
+
 }
 
 function runDiagnostics() {
@@ -418,13 +420,14 @@ function filterWIEntriesInPlace(entries, excludedBooks, excludedEntryKeys) {
     }
 }
 
-function createWILoadFilterHandler(settings) {
+function createWILoadFilterHandler(settings, stateRef = { active: true }) {
     const excludedBooks = new Set((settings.excludedWIBooks || []).map(String));
     const excludedEntryKeys = new Set(
         (settings.excludedWIEntries || []).map(e => normalizeWIEntryKey(e?.world, e?.uid)),
     );
 
     return function onWILoaded(payload) {
+        if (!stateRef.active) return;
         if (!payload || (!excludedBooks.size && !excludedEntryKeys.size)) return;
         filterWIEntriesInPlace(payload.globalLore, excludedBooks, excludedEntryKeys);
         filterWIEntriesInPlace(payload.characterLore, excludedBooks, excludedEntryKeys);
@@ -447,14 +450,14 @@ function swapModel(settings) {
     const ctx = getContext();
     const oaiSettings = ctx.chatCompletionSettings;
 
+    // Keep a full snapshot to guarantee exact restoration after ghostwrite.
+    // Partial-field restore can miss edge cases and leave the model changed.
+    const originalSnapshot = JSON.parse(JSON.stringify(oaiSettings));
+
     const provider = settings.provider;
     const model = settings.model || DEFAULT_MODELS[provider] || '';
     const source = PROVIDERS[provider]?.source || provider;
     const modelField = PROVIDER_MODEL_FIELD[source] || PROVIDER_MODEL_FIELD[provider];
-
-    // Save originals
-    const origSource = oaiSettings.chat_completion_source;
-    const origModel = modelField ? oaiSettings[modelField] : undefined;
 
     // Swap
     oaiSettings.chat_completion_source = source;
@@ -464,10 +467,13 @@ function swapModel(settings) {
 
     // Return restore function
     return function restore() {
-        oaiSettings.chat_completion_source = origSource;
-        if (modelField && origModel !== undefined) {
-            oaiSettings[modelField] = origModel;
+        // Remove keys added during temporary swap, then restore snapshot.
+        for (const key of Object.keys(oaiSettings)) {
+            if (!Object.prototype.hasOwnProperty.call(originalSnapshot, key)) {
+                delete oaiSettings[key];
+            }
         }
+        Object.assign(oaiSettings, originalSnapshot);
     };
 }
 
@@ -526,54 +532,42 @@ async function doGhostwrite() {
     updateGenerateButton();
 
     let restoreModel = null;
-    const savedExtSettings = {};
-    const savedExtensionPrompts = {};
     let wiLoadFilterHandler = null;
+    let wiFilterState = null;
+    const savedPromptValues = new Map(); // key → original value string
+    const savedInjectionFlags = new Map(); // extensionName → original enabled value
 
     try {
         const ctx = getContext();
 
-        // Filter excluded WI entries directly on WI load event for this run.
-        // This ensures exclusions apply even if cached world objects are cloned.
-        wiLoadFilterHandler = createWILoadFilterHandler(settings);
+        // ── WI exclusion: filter scan input arrays (safe, does not touch stored WI data) ──
+        wiFilterState = { active: true };
+        wiLoadFilterHandler = createWILoadFilterHandler(settings, wiFilterState);
         eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, wiLoadFilterHandler);
 
-        // Directly mute selected extension prompts during ghostwrite.
-        // This is more reliable than toggling extension settings because
-        // generation reads from ctx.extensionPrompts.
+        // ── Layer 1: Blank extensionPrompts cache values ──
+        // Handles extensions that use setExtensionPrompt() to inject via the
+        // generation pipeline. Only the prompt text is hidden; restored in finally.
         for (const key of getExcludedPromptKeys(settings, ctx)) {
             const prompt = ctx.extensionPrompts?.[key];
-            if (!prompt) continue;
-            savedExtensionPrompts[key] = { ...prompt };
+            if (!prompt || !prompt.value) continue;
+            savedPromptValues.set(key, prompt.value);
             prompt.value = '';
         }
 
-        // Temporarily disable excluded extensions by overriding their settings
-        // (legacy fallback for extensions that regenerate prompts from settings
-        // right before generation)
-        const excluded = settings.excludedExtensions || [];
-        for (const extName of excluded) {
-            const extConf = extension_settings[extName];
-            if (!extConf || typeof extConf !== 'object') continue;
-
-            // Deep-clone original settings to restore later
-            savedExtSettings[extName] = JSON.parse(JSON.stringify(extConf));
-
-            // Set all common disable flags that extensions check
-            extConf.enabled = false;
-            if (extConf.promptInjection) {
-                extConf.promptInjection.enabled = false;
-            }
-            if (extConf.insertType !== undefined) {
-                extConf.insertType = 'disabled';
-            }
-            if (extConf.active !== undefined) {
-                extConf.active = false;
-            }
+        // ── Layer 2: Temporarily suppress event-based prompt injection ──
+        // Some extensions (st-image-auto-generation, AutoPic, etc.) inject
+        // prompts by directly modifying eventData.chat in the
+        // CHAT_COMPLETION_PROMPT_READY event, bypassing the extensionPrompts
+        // cache entirely. They all check promptInjection.enabled before
+        // injecting, so we temporarily set it to false for excluded extensions.
+        // The original value is restored in the finally block.
+        for (const name of (settings.excludedExtensions || [])) {
+            const extConf = extension_settings[name];
+            if (!extConf?.promptInjection || extConf.promptInjection.enabled === undefined) continue;
+            savedInjectionFlags.set(name, extConf.promptInjection.enabled);
+            extConf.promptInjection.enabled = false;
         }
-
-        // Temporarily disable excluded WI books and entries
-        const wiRestore = await disableExcludedWI(settings);
 
         // If custom model mode, swap model before running pipeline
         if (!settings.useMainApi) {
@@ -591,31 +585,48 @@ async function doGhostwrite() {
         console.error('[ST-ghostwrite] Generation error:', err);
         toastr.error('대필 실패: ' + (err.message || err));
     } finally {
-        // Remove temporary WI filter hook
+        // ── Restore blanked extension prompt values ──
+        try {
+            const ctx = getContext();
+            for (const [key, originalValue] of savedPromptValues) {
+                if (ctx.extensionPrompts?.[key]) {
+                    ctx.extensionPrompts[key].value = originalValue;
+                }
+            }
+        } catch (e) {
+            console.warn('[ST-ghostwrite] Extension prompt restore failed', e);
+        }
+
+        // ── Restore event-based injection flags ──
+        for (const [name, originalEnabled] of savedInjectionFlags) {
+            try {
+                if (extension_settings[name]?.promptInjection) {
+                    extension_settings[name].promptInjection.enabled = originalEnabled;
+                }
+            } catch (e) {
+                console.warn(`[ST-ghostwrite] Injection flag restore failed for ${name}`, e);
+            }
+        }
+
+        if (wiFilterState) wiFilterState.active = false;
+
+        // Remove WI filter hook if still registered
         if (wiLoadFilterHandler) {
             eventSource.removeListener(event_types.WORLDINFO_ENTRIES_LOADED, wiLoadFilterHandler);
         }
 
-        // Restore muted extension prompts
-        const ctx = getContext();
-        for (const [key, originalPrompt] of Object.entries(savedExtensionPrompts)) {
-            if (ctx.extensionPrompts?.[key]) {
-                Object.assign(ctx.extensionPrompts[key], originalPrompt);
-            } else if (ctx.extensionPrompts) {
-                ctx.extensionPrompts[key] = originalPrompt;
+        // Restore original model
+        try {
+            if (restoreModel) {
+                restoreModel();
+                // Force-save restored settings so a pending debounced save
+                // doesn't accidentally persist the swapped model to disk.
+                saveSettingsDebounced();
             }
+        } catch (e) {
+            console.warn('[ST-ghostwrite] Model restore failed', e);
         }
 
-        // Restore excluded extensions to their original settings
-        for (const [extName, originalConf] of Object.entries(savedExtSettings)) {
-            Object.assign(extension_settings[extName], originalConf);
-        }
-        // Restore excluded WI books/entries
-        if (typeof wiRestore === 'function') wiRestore();
-        // Always restore original model
-        if (restoreModel) {
-            restoreModel();
-        }
         isGenerating = false;
         updateGenerateButton();
     }
@@ -803,10 +814,10 @@ function updateGenerateButton() {
     if (!btn) return;
 
     if (isGenerating) {
-        btn.innerHTML = '<i class="fa-solid fa-stop"></i><span>중지</span>';
+        btn.innerHTML = '<i class="fa-solid fa-stop"></i><span style="font-size: 14px !important;">중지</span>';
         btn.classList.add('gw-generating');
     } else {
-        btn.innerHTML = '<i class="fa-solid fa-feather-pointed"></i><span>대필</span>';
+        btn.innerHTML = '<i class="fa-solid fa-feather-pointed"></i><span style="font-size: 14px !important;">대필</span>';
         btn.classList.remove('gw-generating');
     }
 }
@@ -1191,51 +1202,9 @@ async function populateWIExclusionList() {
     }
 }
 
-async function disableExcludedWI(settings) {
-    const excludedBooks = settings.excludedWIBooks || [];
-    const excludedEntries = settings.excludedWIEntries || [];
-    if (!excludedBooks.length && !excludedEntries.length) return null;
-
-    const restoredEntries = []; // { data, uid, originalDisable }
-
-    // Disable ALL entries of excluded books
-    for (const bookName of excludedBooks) {
-        try {
-            const data = await loadWorldInfo(bookName);
-            if (data && data.entries) {
-                for (const uid of Object.keys(data.entries)) {
-                    const entry = data.entries[uid];
-                    restoredEntries.push({ data, uid, originalDisable: !!entry.disable });
-                    entry.disable = true;
-                }
-            }
-        } catch (e) {
-            console.warn(`[ST-ghostwrite] Could not disable WI book ${bookName}`, e);
-        }
-    }
-
-    // Disable specific entries
-    for (const { world: bookName, uid } of excludedEntries) {
-        try {
-            const data = await loadWorldInfo(bookName);
-            if (data && data.entries && data.entries[uid]) {
-                restoredEntries.push({ data, uid, originalDisable: !!data.entries[uid].disable });
-                data.entries[uid].disable = true;
-            }
-        } catch (e) {
-            console.warn(`[ST-ghostwrite] Could not disable WI entry ${bookName}:${uid}`, e);
-        }
-    }
-
-    // Return restore function
-    return () => {
-        for (const { data, uid, originalDisable } of restoredEntries) {
-            if (data.entries[uid]) {
-                data.entries[uid].disable = originalDisable;
-            }
-        }
-    };
-}
+// disableExcludedWI removed: WI exclusion is now handled entirely via
+// WORLDINFO_ENTRIES_LOADED event filter, which only modifies the temporary
+// scan input arrays — never the stored WI data objects.
 
 function bindSettingsEvents() {
     const settings = getSettings();
